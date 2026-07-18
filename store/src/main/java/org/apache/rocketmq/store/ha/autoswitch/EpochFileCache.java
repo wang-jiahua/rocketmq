@@ -264,9 +264,10 @@ public class EpochFileCache {
         this.writeLock.lock();
         try {
             this.epochMap.entrySet().removeIf(entry -> predict.test(entry.getValue()));
-            final EpochEntry entry = lastEntry();
-            if (entry != null) {
-                entry.setEndOffset(Long.MAX_VALUE);
+            // Reset the new last entry to be open-ended. Note we must mutate the entry stored in
+            // the map directly; lastEntry() returns a defensive copy, so mutating it would be lost.
+            if (!this.epochMap.isEmpty()) {
+                this.epochMap.lastEntry().getValue().setEndOffset(EpochEntry.LAST_EPOCH_END_OFFSET);
             }
             flush();
         } finally {

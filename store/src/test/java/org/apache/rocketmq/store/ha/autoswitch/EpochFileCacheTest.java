@@ -146,4 +146,21 @@ public class EpochFileCacheTest {
         final long consistentPoint = this.epochCache2.findConsistentPoint(this.epochCache);
         assertEquals(consistentPoint, 700);
     }
+
+    @Test
+    public void testTruncateSuffixByEpochResetsLastEntryEndOffset() {
+        // After the tail epoch is truncated away, the new last epoch must become open-ended
+        // (endOffset = LAST_EPOCH_END_OFFSET). Otherwise it keeps the stale finite endOffset that
+        // was assigned when the removed successor was appended, and findEpochEntryByOffset() would
+        // wrongly return null for offsets that fall into the new last epoch.
+        this.epochCache.truncateSuffixByEpoch(3);
+        final EpochEntry lastEntry = this.epochCache.lastEntry();
+        assertNotNull(lastEntry);
+        assertEquals(2, lastEntry.getEpoch());
+        assertEquals(Long.MAX_VALUE, lastEntry.getEndOffset());
+        // An offset far beyond the old (stale) endOffset must still resolve to the new last epoch.
+        final EpochEntry found = this.epochCache.findEpochEntryByOffset(100000);
+        assertNotNull(found);
+        assertEquals(2, found.getEpoch());
+    }
 }
