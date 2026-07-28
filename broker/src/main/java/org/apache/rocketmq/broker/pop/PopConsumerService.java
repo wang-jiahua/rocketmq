@@ -102,7 +102,7 @@ public class PopConsumerService extends ServiceThread {
             brokerController.getMessageStoreConfig().getPopRocksdbBlockCacheSize(),
             brokerController.getMessageStoreConfig().getPopRocksdbWriteBufferSize());
         this.popConsumerCache = brokerConfig.isEnablePopBufferMerge() ? new PopConsumerCache(
-            brokerController, this.popConsumerStore, this.consumerLockService, this::revive) : null;
+            brokerController, this.popConsumerStore, this.consumerLockService, this::reviveFromCache) : null;
 
         log.info("PopConsumerService init, buffer={}, rocksdb filePath={}",
             brokerConfig.isEnablePopBufferMerge(), this.popConsumerStore.getFilePath());
@@ -588,6 +588,48 @@ public class PopConsumerService extends ServiceThread {
                 }
                 return CompletableFuture.completedFuture(this.reviveRetry(record, result.getLeft()));
             });
+    }
+
+    /**
+     * Revive callback for the PopConsumerCache sweep. The cache uses it as a void consumer and
+     * discards the returned future, and clearStagedRecords() then drops the staged records
+     * unconditionally without persisting them. A failed revive therefore has to persist a
+     * backoff-retry record here, otherwise the checkpoint is lost and the message is never revived.
+     */
+    private void reviveFromCache(PopConsumerRecord record) {
+        CompletableFuture<Boolean> future;
+        try {
+            future = this.revive(record);
+        } catch (Exception e) {
+            log.error("PopConsumerService reviveFromCache threw synchronously, record={}", record, e);
+            future = CompletableFuture.completedFuture(false);
+        }
+        future.exceptionally(throwable -> {
+            log.error("PopConsumerService reviveFromCache failed, record={}", record, throwable);
+            return false;
+        }).thenAccept(result -> {
+            if (!result) {
+                try {
+                    if (record.getAttemptTimes() < brokerConfig.getPopReviveMaxAttemptTimes()) {
+                        long backoffInterval = 1000L * REWRITE_INTERVALS_IN_SECONDS[
+                            Math.min(REWRITE_INTERVALS_IN_SECONDS.length - 1, record.getAttemptTimes())];
+                        long nextInvisibleTime = record.getInvisibleTime() + backoffInterval;
+                        PopConsumerRecord retryRecord = new PopConsumerRecord(System.currentTimeMillis(),
+                            record.getGroupId(), record.getTopicId(), record.getQueueId(), record.getRetryFlag(),
+                            nextInvisibleTime, record.getOffset(), record.getAttemptId(), record.isSuspend());
+                        retryRecord.setAttemptTimes(record.getAttemptTimes() + 1);
+                        this.popConsumerStore.writeRecords(Collections.singletonList(retryRecord));
+                        log.warn("PopConsumerService reviveFromCache backoff retry, record={}", retryRecord);
+                    } else {
+                        log.error("PopConsumerService reviveFromCache drop record, " +
+                            "message may be lost, record={}", record);
+                    }
+                } catch (Exception e) {
+                    log.error("PopConsumerService reviveFromCache persist retry record failed, " +
+                        "message may be lost, record={}", record, e);
+                }
+            }
+        });
     }
 
     public void clearCache(String groupId, String topicId, int queueId) {

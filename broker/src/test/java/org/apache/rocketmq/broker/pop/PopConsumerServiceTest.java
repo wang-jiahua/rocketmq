@@ -26,6 +26,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import org.apache.commons.io.FileUtils;
@@ -66,6 +67,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -143,6 +145,61 @@ public class PopConsumerServiceTest {
             consumerCache.writeRecords(Collections.singletonList(record));
         }
         Assert.assertTrue(consumerService.isPopShouldStop(groupId, topicId, queueId));
+    }
+
+    @Test
+    public void cacheCleanupShouldPersistRetryRecordWhenReviveFailsAsynchronously() throws IllegalAccessException {
+        // Cache path regression for a revive future that completes exceptionally (ISSUE #10667):
+        // cleanupRecords discards the future returned by the revive callback, the records handed
+        // to the callback are never written to the store, and clearStagedRecords() then clears
+        // the whole staging map unconditionally. Unless the failure handler persists a
+        // backoff-retry record, the checkpoint vanishes and the message is never revived.
+        EscapeBridge escapeBridge = Mockito.mock(EscapeBridge.class);
+        Mockito.when(brokerController.getEscapeBridge()).thenReturn(escapeBridge);
+        Mockito.when(brokerController.getSubscriptionGroupManager()
+            .containsSubscriptionGroup(anyString())).thenReturn(true);
+        CompletableFuture<Triple<MessageExt, String, Boolean>> failed = new CompletableFuture<>();
+        failed.completeExceptionally(new RuntimeException("simulated async read failure"));
+        Mockito.when(escapeBridge.getMessageAsync(anyString(), anyLong(), anyInt(), anyString(), anyBoolean()))
+            .thenReturn(failed);
+
+        consumerService.getPopConsumerStore().start();
+
+        // use the production wiring bound at construction time, not a test stand-in
+        PopConsumerCache consumerCache = (PopConsumerCache) FieldUtils.readField(
+            consumerService, "popConsumerCache", true);
+        @SuppressWarnings("unchecked")
+        Consumer<PopConsumerRecord> reviveConsumer = (Consumer<PopConsumerRecord>)
+            FieldUtils.readField(consumerCache, "reviveConsumer", true);
+
+        // keep the consumer online so cleanupRecords takes the revive branch instead of the
+        // offline eviction branch, isLockTimeout returns true for a key that was never locked
+        consumerService.getConsumerLockService().tryLock(groupId, topicId);
+        consumerService.getConsumerLockService().unlock(groupId, topicId);
+
+        // an already expired record: staged by stageExpiredRecords and handed to the callback;
+        // suspend=true must survive into the backoff record, otherwise a later successful
+        // reviveRetry would increment reconsumeTimes unexpectedly
+        PopConsumerRecord record = getConsumerTestRecord();
+        record.setPopTime(System.currentTimeMillis() - TimeUnit.SECONDS.toMillis(5));
+        record.setInvisibleTime(TimeUnit.SECONDS.toMillis(1));
+        record.setOffset(100L);
+        record.setSuspend(true);
+        consumerCache.writeRecords(Collections.singletonList(record));
+
+        consumerCache.cleanupRecords(reviveConsumer);
+
+        // the record must leave the cache, and its checkpoint must survive in the store as a
+        // backoff-retry record with attemptTimes incremented instead of silently vanishing
+        Assert.assertEquals(0, consumerCache.getPopInFlightMessageCount(groupId, topicId, queueId));
+        List<PopConsumerRecord> persisted = consumerService.getPopConsumerStore().scanExpiredRecords(
+            0, System.currentTimeMillis() + TimeUnit.HOURS.toMillis(1), 10);
+        Assert.assertEquals(1, persisted.size());
+        Assert.assertEquals(100L, persisted.get(0).getOffset());
+        Assert.assertEquals(1, persisted.get(0).getAttemptTimes());
+        Assert.assertTrue("suspend flag must be preserved in the backoff record", persisted.get(0).isSuspend());
+
+        consumerService.getPopConsumerStore().shutdown();
     }
 
     @Test
